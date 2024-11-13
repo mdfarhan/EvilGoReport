@@ -934,6 +934,10 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
                 # Create set to track seen events for this target
                 seen_detail_events = set()
 
+                def clean_ip(ip_address):
+                    """Remove port number from IP address if present"""
+                    return ip_address.split(':')[0] if ':' in ip_address else ip_address
+                
                 # Go through all events to find events for this target
                 for event in self.timeline:
                     if event.message == "Email Sent" and event.email == target.email:
@@ -963,11 +967,12 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
                         temp = event.time.split('T')
                         worksheet.write(row, col, f"{temp[0]} {temp[1].split('.')[0]}", wrap_format)
                         
-                        # Add IP address
-                        worksheet.write(row, col + 1, f"{event.details['browser']['address']}", wrap_format)
+                        # Clean and add IP address
+                        ip = clean_ip(event.details['browser']['address'])
+                        worksheet.write(row, col + 1, ip, wrap_format)
                         
-                        # Add location data
-                        loc = self.geolocate(target, event.details['browser']['address'], self.google)
+                        # Add location data with cleaned IP
+                        loc = self.geolocate(target, ip, self.google)
                         worksheet.write(row, col + 2, loc, wrap_format)
                         
                         # Add browser and OS details
@@ -1007,9 +1012,13 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
 
                             temp = event.time.split('T')
                             worksheet.write(row, col, f"{temp[0]} {temp[1].split('.')[0]}", wrap_format)
-                            worksheet.write(row, col + 1, f"{event.details['browser']['address']}", wrap_format)
                             
-                            loc = self.geolocate(target, event.details['browser']['address'], self.google)
+                            # Clean and add IP address
+                            ip = clean_ip(event.details['browser']['address'])
+                            worksheet.write(row, col + 1, ip, wrap_format)
+                            
+                            # Add location data with cleaned IP
+                            loc = self.geolocate(target, ip, self.google)
                             worksheet.write(row, col + 2, loc, wrap_format)
 
                             user_agent = parse(event.details['browser']['user-agent'])
@@ -1041,15 +1050,13 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
 
                         temp = event.time.split('T')
                         worksheet.write(row, col, f"{temp[0]} {temp[1].split('.')[0]}", wrap_format)
-
-                        # Check if browser IP matches the target's IP and record result
-                        ip_comparison = self.compare_ip_addresses(target.ip,
-                                                                event.details['browser']['address'],
-                                                                self.verbose)
-                        worksheet.write(row, col + 1, f"{ip_comparison}", wrap_format)
-
-                        # Parse the location data
-                        loc = self.geolocate(target, event.details['browser']['address'], self.google)
+                        
+                        # Clean and add IP address
+                        ip = clean_ip(event.details['browser']['address'])
+                        worksheet.write(row, col + 1, ip, wrap_format)
+                        
+                        # Add location data with cleaned IP
+                        loc = self.geolocate(target, ip, self.google)
                         worksheet.write(row, col + 2, loc, wrap_format)
 
                         # Parse the user-agent string and add browser and OS details
@@ -1216,7 +1223,7 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
             worksheet.write(row, header_col, header, header_format)
             header_col += 1
         row += 1
-        counted_ip_addresses = Counter(self.ip_addresses)
+        counted_ip_addresses = Counter([clean_ip(ip) for ip in self.ip_addresses])
         for key, value in counted_ip_addresses.items():
             worksheet.write(row, col, f"{key}", wrap_format)
             worksheet.write_number(row, col + 1, value, num_format)
