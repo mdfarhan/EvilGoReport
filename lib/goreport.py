@@ -30,6 +30,7 @@ from docx.enum.style import WD_STYLE_TYPE
 from docx.shared import Cm, Pt, RGBColor
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from user_agents import parse
+from datetime import datetime, timedelta
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
@@ -71,16 +72,19 @@ class Goreport(object):
     total_opened = 0
     total_targets = 0
     total_clicked = 0
-    total_reported = 0
+    total_mfa = 0
     total_submitted = 0
     total_unique_opened = 0
     total_unique_clicked = 0
-    total_unique_reported = 0
+    total_unique_mfa = 0
     total_unique_submitted = 0
     targets_opened = []
     targets_clicked = []
-    targets_reported = []
+    targets_mfa = []
     targets_submitted = []
+    
+    user_submission_counts = {}  # Track submissions per user
+    user_mfa_counts = {}        # Track MFA attempts per user
 
     # Lists and dicts for holding prepared report data
     campaign_results_summary = []
@@ -447,6 +451,8 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
                 self.results = self.campaign.results
                 self.timeline = self.campaign.timeline
         except:
+            self.results = self.campaign.results
+            self.timeline = self.campaign.timeline
             print(f"[!] Looks like campaign ID {self.cam_id} does not exist! Skipping it...")
 
     def process_results(self, combine_reports):
@@ -466,7 +472,7 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
             # Not combining, so reset counters
             self.total_unique_opened = 0
             self.total_unique_clicked = 0
-            self.total_unique_reported = 0
+            self.total_unique_mfa = 0
             self.total_unique_submitted = 0
             # Reports will not be combined, so reset tracking between reports
             self.total_targets = len(self.campaign.results)
@@ -510,64 +516,131 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
                 self.total_unique_submitted += 1
             else:
                 temp_dict["submitted"] = False
-            # Check if this target reported the email
-            if target.email in self.targets_reported:
-                temp_dict["reported"] = True
-                self.total_unique_reported += 1
+            # Check if this target mfa the email
+            if target.email in self.targets_mfa:
+                temp_dict["mfa"] = True
+                self.total_unique_mfa += 1
             else:
-                temp_dict["reported"] = False
+                temp_dict["mfa"] = False
             # Append the temp dictionary to the event summary list
             self.campaign_results_summary.append(temp_dict)
 
     def process_timeline_events(self, combine_reports):
-        """Process the timeline model to collect basic data, like total clicks, and get detailed
-        event data for recipients.
-
-        The timeline model contains all events that occurred during the campaign.
-        """
-        # Create counters for enumeration
+        """Process timeline events with deduplication and count tracking"""
         sent_counter = 0
         click_counter = 0
         opened_counter = 0
-        reported_counter = 0
+        mfa_counter = 0
         submitted_counter = 0
 
         # Reset target lists
         self.targets_opened = []
         self.targets_clicked = []
-        self.targets_reported = []
+        self.targets_mfa = []
         self.targets_submitted = []
-        # Run through all events and count each of the four basic events
+        
+        # Create dict to track events by rounded timestamp
+        seen_events = {}  # Will store {email: {message_type: [(timestamp, payload)]}}
+        
+        # Reset tracking dictionaries if not combining reports
+        if not combine_reports:
+            self.user_submission_counts = {}
+            self.user_mfa_counts = {}
+        
+        def is_duplicate_event(email, message, current_time, payload=""):
+            """Helper function to check if an event is a duplicate within 2 seconds"""
+            if email not in seen_events:
+                seen_events[email] = {}
+            if message not in seen_events[email]:
+                seen_events[email][message] = []
+                return False
+            
+            # Convert current time string to datetime object
+            current_dt = datetime.strptime(current_time.split('.')[0], "%Y-%m-%dT%H:%M:%S")
+            
+            # Check for similar events within 2 seconds
+            for prev_time, prev_payload in seen_events[email][message]:
+                prev_dt = datetime.strptime(prev_time.split('.')[0], "%Y-%m-%dT%H:%M:%S")
+                time_diff = abs((current_dt - prev_dt).total_seconds())
+                
+                # If within 2 seconds and same payload (for submissions)
+                if time_diff <= 2:
+                    if message == "Submitted Data" or message == "Captured Session":
+                        if payload == prev_payload:
+                            return True
+                    else:
+                        return True
+            return False
+
+        # First pass: Deduplicate and store unique events
+        unique_events = []
         for event in self.campaign.timeline:
-            if event.message == "Email Sent":
+            if event.message == "Email/SMS Sent":
                 sent_counter += 1
-            elif event.message == "Email Opened":
-                opened_counter += 1
-                self.targets_opened.append(event.email)
+                continue
+                    
+            elif event.message == "Email/SMS Opened":
+                if not is_duplicate_event(event.email, event.message, event.time):
+                    seen_events[event.email][event.message].append((event.time, ""))
+                    opened_counter += 1
+                    self.targets_opened.append(event.email)
+                    unique_events.append(event)
+                        
             elif event.message == "Clicked Link":
-                click_counter += 1
-                self.targets_clicked.append(event.email)
+                if not is_duplicate_event(event.email, event.message, event.time):
+                    seen_events[event.email][event.message].append((event.time, ""))
+                    click_counter += 1
+                    self.targets_clicked.append(event.email)
+                    unique_events.append(event)
+                        
             elif event.message == "Submitted Data":
-                submitted_counter += 1
-                self.targets_submitted.append(event.email)
-            elif event.message == "Email Reported":
-                reported_counter += 1
-                self.targets_reported.append(event.email)
-        # Assign the counter values to our tracking lists
+                # Create payload string for comparison
+                payload_str = ""
+                if 'payload' in event.details:
+                    payload_items = sorted(event.details['payload'].items())
+                    payload_str = ','.join(f"{k}:{v}" for k, v in payload_items if k != 'rid')
+                    
+                if not is_duplicate_event(event.email, event.message, event.time, payload_str):
+                    seen_events[event.email][event.message].append((event.time, payload_str))
+                    submitted_counter += 1
+                    if event.email not in self.targets_submitted:
+                        self.targets_submitted.append(event.email)
+                    self.user_submission_counts[event.email] = self.user_submission_counts.get(event.email, 0) + 1
+                    unique_events.append(event)
+                        
+            elif event.message == "Captured Session":
+                if not is_duplicate_event(event.email, event.message, event.time):
+                    seen_events[event.email][event.message].append((event.time, ""))
+                    mfa_counter += 1
+                    if event.email not in self.targets_mfa:
+                        self.targets_mfa.append(event.email)
+                    self.user_mfa_counts[event.email] = self.user_mfa_counts.get(event.email, 0) + 1
+                    unique_events.append(event)
+
+        # Replace timeline with deduplicated events
+        self.timeline = unique_events
+
+        # Update totals
         if combine_reports:
-            # Append, +=, totals if combining reports
             self.total_sent += sent_counter
             self.total_opened += opened_counter
             self.total_clicked += click_counter
-            self.total_reported += reported_counter
+            self.total_mfa += mfa_counter
             self.total_submitted += submitted_counter
         else:
-            # Set tracking variables to current counter values for non-combined reports
             self.total_sent = sent_counter
             self.total_opened = opened_counter
             self.total_clicked = click_counter
-            self.total_reported = reported_counter
+            self.total_mfa = mfa_counter
             self.total_submitted = submitted_counter
+
+        if self.verbose:
+            print(f"[+] Processed timeline events:")
+            print(f"    Sent: {sent_counter}")
+            print(f"    Opened: {opened_counter}")
+            print(f"    Clicked: {click_counter}")
+            print(f"    Submitted: {submitted_counter}")
+            print(f"    MFA: {mfa_counter}")
 
     def generate_report(self):
         """Determines which type of report generate and the calls the appropriate reporting
@@ -613,7 +686,18 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
         print(f"Individuals Who Opened:\t\t\t{self.total_unique_opened}")
         print(f"Individuals Who Clicked:\t\t{self.total_unique_clicked}")
         print(f"Individuals Who Entered Data:\t\t{self.total_unique_submitted}")
-        print(f"Individuals Who Reported the Email:\t{self.total_unique_reported}")
+        print(f"Individuals Who Entered MFA:\t{self.total_unique_mfa}")
+        print("\nSubmission Statistics:")
+        print(f"Total Credential Submissions: {sum(self.user_submission_counts.values())}")
+        print(f"Total MFA Completions: {sum(self.user_mfa_counts.values())}")
+        print(f"Unique Users Who Submitted: {len(self.user_submission_counts)}")
+        print(f"Unique Users Who Completed MFA: {len(self.user_mfa_counts)}")
+        
+        if self.user_submission_counts:
+            print("\nTop 20 Users by Submissions:")
+            sorted_submissions = sorted(self.user_submission_counts.items(), key=lambda x: x[1], reverse=True)
+            for email, count in sorted_submissions[:20]:
+                print(f"{email}: {count} submissions")
 
     def _build_output_xlsx_file_name(self):
         """Create the xlsx report name."""
@@ -680,6 +764,14 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
         wrap_format.set_text_wrap()
         wrap_format.set_align('vcenter')
 
+        # Add a new format for user headers with background color
+        user_header_format = goreport_xlsx.add_format({
+            'bold': True,
+            'bg_color': '#D9D9D9',  # Light gray background
+            'font_size': 12,
+            'border': 1
+        })
+
         worksheet = goreport_xlsx.add_worksheet("Overview")
         col = 0
         row = 0
@@ -691,9 +783,6 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
         row += 1
         worksheet.write(row, col, "Status", bold_format)
         worksheet.write(row, col + 1, f"{self.cam_status}", wrap_format)
-        row += 1
-        worksheet.write(row, col, "Created", bold_format)
-        worksheet.write(row, col + 1, f"{self.created_date}", wrap_format)
         row += 1
         worksheet.write(row, col, "Started", bold_format)
         worksheet.write(row, col + 1, f"{self.launch_date}", wrap_format)
@@ -717,18 +806,7 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
         worksheet.write(row, col, "Phish URL", bold_format)
         worksheet.write(row, col + 1, f"{self.cam_url}", wrap_format)
         row += 1
-        worksheet.write(row, col, "Redirect URL", bold_format)
-        worksheet.write(row, col + 1, f"{self.cam_redirect_url}", wrap_format)
-        row += 1
-        worksheet.write(row, col, "Attachment(s)", bold_format)
-        worksheet.write(row, col + 1, f"{self.cam_template_attachments}", wrap_format)
-        row += 1
-        worksheet.write(row, col, "Captured Passwords", bold_format)
-        worksheet.write(row, col + 1, f"{self.cam_capturing_credentials}", wrap_format)
-        row += 1
-        worksheet.write(row, col, "Stored Passwords", bold_format)
-        worksheet.write(row, col + 1, f"{self.cam_capturing_passwords}", wrap_format)
-        row += 1
+    
 
         worksheet.write(row, col, "")
         row += 1
@@ -740,38 +818,35 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
         worksheet.write(row, col + 1, self.total_targets, num_format)
         row += 1
 
-        worksheet.write(row, col, "The following totals indicate how many events of each type Gophish recorded:", wrap_format)
-        row += 1
-        worksheet.write(row, col, "Total Opened Events", bold_format)
-        worksheet.write_number(row, col + 1, self.total_opened, num_format)
+        worksheet.write(row, col, "The following totals indicate how many events of each type were recorded:", wrap_format)
         row += 1
         worksheet.write(row, col, "Total Clicked Events", bold_format)
         worksheet.write_number(row, col + 1, self.total_clicked, num_format)
         row += 1
-        worksheet.write(row, col, "Total Submitted Data Events", bold_format)
-        worksheet.write(row, col + 1, "", wrap_format)
+        worksheet.write(row, col, "Total Password Submit Events", bold_format)
+        worksheet.write_number(row, col + 1, self.total_submitted, num_format)
         row += 1
-        worksheet.write(row, col, "Total Report Events", bold_format)
-        worksheet.write_number(row, col + 1, self.total_reported, num_format)
+        worksheet.write(row, col, "Total MFA Submit Events", bold_format)
+        worksheet.write_number(row, col + 1, self.total_mfa, num_format)
         row += 1
 
         worksheet.write(row, col, "The following totals indicate how many targets participated in each event type:", wrap_format)
         row += 1
-        worksheet.write(row, col, "Individuals Who Opened", bold_format)
-        worksheet.write_number(row, col + 1, self.total_unique_opened, num_format)
-        row += 1
         worksheet.write(row, col, "Individuals Who Clicked", bold_format)
         worksheet.write_number(row, col + 1, self.total_unique_clicked, num_format)
         row += 1
-        worksheet.write(row, col, "Individuals Who Submitted Data", bold_format)
+        worksheet.write(row, col, "Individuals Who Submitted Password", bold_format)
         worksheet.write_number(row, col + 1, self.total_unique_submitted, num_format)
         row += 1
-        worksheet.write(row, col, "Individuals Who Reported", bold_format)
-        worksheet.write_number(row, col + 1, self.total_unique_reported, num_format)
+        worksheet.write(row, col, "Individuals Who Submitted MFA", bold_format)
+        worksheet.write_number(row, col + 1, self.total_unique_mfa, num_format)
         row += 1
 
         worksheet.write(row, col, "")
         row += 1
+        
+        
+     
 
         worksheet = goreport_xlsx.add_worksheet("Summary")
         row = 0
@@ -783,7 +858,7 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
         row += 1
 
         header_col = 0
-        headers = ["Email Address", "Open", "Click", "Creds", "Report", "OS", "Browser"]
+        headers = ["Email Address", "Click", "Creds", "MFA", "OS", "Browser"]
         for header in headers:
             worksheet.write(row, header_col, header, header_format)
             header_col += 1
@@ -794,22 +869,18 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
         ordered_results = sorted(self.campaign_results_summary, key=lambda k: k['email'])
         for target in ordered_results:
             worksheet.write(row, col, target['email'], wrap_format)
-            if target['opened']:
-                worksheet.write_boolean(row, col + 1, target['opened'], true_format)
-            else:
-                worksheet.write_boolean(row, col + 1, target['opened'], false_format)
             if target['clicked']:
-                worksheet.write_boolean(row, col + 2, target['clicked'], true_format)
+                worksheet.write_boolean(row, col + 1, target['clicked'], true_format)
             else:
-                worksheet.write_boolean(row, col + 2, target['clicked'], false_format)
+                worksheet.write_boolean(row, col + 1, target['clicked'], false_format)
             if target['submitted']:
-                worksheet.write_boolean(row, col + 3, target['submitted'], true_format)
+                worksheet.write_boolean(row, col + 2, target['submitted'], true_format)
             else:
-                worksheet.write_boolean(row, col + 3, target['submitted'], false_format)
-            if target['reported']:
-                worksheet.write_boolean(row, col + 4, target['reported'], true_format)
+                worksheet.write_boolean(row, col + 2, target['submitted'], false_format)
+            if target['mfa']:
+                worksheet.write_boolean(row, col + 3, target['mfa'], true_format)
             else:
-                worksheet.write_boolean(row, col + 4, target['reported'], false_format)
+                worksheet.write_boolean(row, col + 3, target['mfa'], false_format)
             if target['email'] in self.targets_clicked:
                 for event in self.timeline:
                     if event.message == "Clicked Link" and event.email == target['email']:
@@ -817,11 +888,11 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
                         browser_details = user_agent.browser.family + " " + \
                             user_agent.browser.version_string
                         os_details = user_agent.os.family + " " + user_agent.os.version_string
-                        worksheet.write(row, col + 5, browser_details, wrap_format)
-                        worksheet.write(row, col + 6, os_details, wrap_format)
+                        worksheet.write(row, col + 4, browser_details, wrap_format)
+                        worksheet.write(row, col + 5, os_details, wrap_format)
             else:
+                worksheet.write(row, col + 4, "N/A", wrap_format)
                 worksheet.write(row, col + 5, "N/A", wrap_format)
-                worksheet.write(row, col + 6, "N/A", wrap_format)
             row += 1
             target_counter += 1
             print(f"[+] Created row for {target_counter} of {self.total_targets}.")
@@ -841,15 +912,28 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
 
         target_counter = 0
         for target in self.results:
-            # Only create a Detailed Analysis section for targets with clicks
-            if target.email in self.targets_clicked:
+            # Only create a Detailed Analysis section for targets with clicks or MFA
+            if target.email in self.targets_clicked or target.email in self.targets_submitted or target.email in self.targets_mfa:
+                # Add spacing before each new user section
+                worksheet.write(row, col, "", wrap_format)
+                row += 1
+                
+                # Write user header with distinct formatting
                 position = ""
                 if target.position:
                     position = f"({target.position})"
-                worksheet.write(row, col, f"{target.first_name} {target.last_name} {position}", bold_format)
+                worksheet.write(row, col, f"{target.first_name} {target.last_name} {position}", user_header_format)
                 row += 1
-                worksheet.write(row, col, target.email, wrap_format)
+                worksheet.write(row, col, target.email, user_header_format)
                 row += 1
+                
+                # Add a blank line after the header
+                worksheet.write(row, col, "", wrap_format)
+                row += 1
+
+                # Create set to track seen events for this target
+                seen_detail_events = set()
+
                 # Go through all events to find events for this target
                 for event in self.timeline:
                     if event.message == "Email Sent" and event.email == target.email:
@@ -857,18 +941,95 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
                         temp = event.time.split('T')
                         sent_date = temp[0]
                         sent_time = temp[1].split('.')[0]
-                        # Record the email sent date and time in the report
                         worksheet.write(row, col, f"Sent on {sent_date.replace(',', '')} at {sent_time}", wrap_format)
                         row += 1
 
-                    if event.message == "Email Opened" and event.email == target.email:
-                        # Record the email preview date and time in the report
+                    elif event.message == "Email Opened" and event.email == target.email:
                         temp = event.time.split('T')
                         worksheet.write(row, col, f"Email Preview at {temp[0]} {temp[1].split('.')[0]}", wrap_format)
                         row += 1
 
-                    if event.message == "Clicked Link" and event.email == target.email:
+                    elif event.message == "Clicked Link" and event.email == target.email:
                         worksheet.write(row, col, "Email Link Clicked", bold_format)
+                        row += 1
+
+                        header_col = 0
+                        headers = ["Time", "IP", "Location", "Browser", "Operating System"]
+                        for header in headers:
+                            worksheet.write(row, header_col, header, header_format)
+                            header_col += 1
+                        row += 1
+
+                        temp = event.time.split('T')
+                        worksheet.write(row, col, f"{temp[0]} {temp[1].split('.')[0]}", wrap_format)
+                        
+                        # Add IP address
+                        worksheet.write(row, col + 1, f"{event.details['browser']['address']}", wrap_format)
+                        
+                        # Add location data
+                        loc = self.geolocate(target, event.details['browser']['address'], self.google)
+                        worksheet.write(row, col + 2, loc, wrap_format)
+                        
+                        # Add browser and OS details
+                        user_agent = parse(event.details['browser']['user-agent'])
+                        browser_details = user_agent.browser.family + " " + user_agent.browser.version_string
+                        worksheet.write(row, col + 3, browser_details, wrap_format)
+                        self.browsers.append(browser_details)
+                        
+                        os_details = user_agent.os.family + " " + user_agent.os.version_string
+                        worksheet.write(row, col + 4, os_details, wrap_format)
+                        self.operating_systems.append(os_details)
+                        
+                        row += 1
+
+                    elif event.message == "Submitted Data" and event.email == target.email:
+                        # Create unique event identifier including payload
+                        payload_str = ""
+                        if 'payload' in event.details:
+                            payload_items = sorted(event.details['payload'].items())
+                            payload_str = ','.join(f"{k}:{v}" for k, v in payload_items if k != 'rid')
+                        
+                        event_id = (event.email, event.message, event.time, payload_str)
+                        
+                        # Only process if we haven't seen this exact event before
+                        if event_id not in seen_detail_events:
+                            seen_detail_events.add(event_id)
+                            
+                            worksheet.write(row, col, "Submitted Password Captured", bold_format)
+                            row += 1
+
+                            header_col = 0
+                            headers = ["Time", "IP", "Location", "Browser", "Operating System", "Data Captured"]
+                            for header in headers:
+                                worksheet.write(row, header_col, header, header_format)
+                                header_col += 1
+                            row += 1
+
+                            temp = event.time.split('T')
+                            worksheet.write(row, col, f"{temp[0]} {temp[1].split('.')[0]}", wrap_format)
+                            worksheet.write(row, col + 1, f"{event.details['browser']['address']}", wrap_format)
+                            
+                            loc = self.geolocate(target, event.details['browser']['address'], self.google)
+                            worksheet.write(row, col + 2, loc, wrap_format)
+
+                            user_agent = parse(event.details['browser']['user-agent'])
+                            browser_details = user_agent.browser.family + " " + user_agent.browser.version_string
+                            worksheet.write(row, col + 3, browser_details, wrap_format)
+
+                            os_details = user_agent.os.family + " " + user_agent.os.version_string
+                            worksheet.write(row, col + 4, os_details, wrap_format)
+
+                            # Write the submitted data
+                            submitted_data = ""
+                            data_payload = event.details['payload']
+                            for key, value in data_payload.items():
+                                if not key == "rid":
+                                    submitted_data += f"{key}:{str(value).strip('[').strip(']')}"
+                            worksheet.write(row, col + 5, submitted_data, wrap_format)
+                            row += 1
+                        
+                    if event.message == "Captured Session" and event.email == target.email:
+                        worksheet.write(row, col, "MFA Session Captured", bold_format)
                         row += 1
 
                         header_col = 0
@@ -883,8 +1044,8 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
 
                         # Check if browser IP matches the target's IP and record result
                         ip_comparison = self.compare_ip_addresses(target.ip,
-                                                                  event.details['browser']['address'],
-                                                                  self.verbose)
+                                                                event.details['browser']['address'],
+                                                                self.verbose)
                         worksheet.write(row, col + 1, f"{ip_comparison}", wrap_format)
 
                         # Parse the location data
@@ -903,47 +1064,7 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
                         self.operating_systems.append(os_details)
                         row += 1
 
-                    if event.message == "Submitted Data" and event.email == target.email:
-                        # Now we have events for submitted data. A few notes on this:
-                        #   1. There is no expectation of a Submit event without a Clicked Link event
-                        #   2. Assuming that, the following process does NOT flag IP mismatches
-                        #      or add to the list of seen locations, OSs, IPs, or browsers.
-                        worksheet.write(row, col, "Submitted Data Captured", bold_format)
-                        row += 1
 
-                        header_col = 0
-                        headers = ["Time", "IP", "Location", "Browser", "Operating System", "Data Captured"]
-                        for header in headers:
-                            worksheet.write(row, header_col, header, header_format)
-                            header_col += 1
-                        row += 1
-
-                        temp = event.time.split('T')
-                        worksheet.write(row, col, f"{temp[0]} {temp[1].split('.')[0]}", wrap_format)
-
-                        worksheet.write(row, col + 1, f"{event.details['browser']['address']}", wrap_format)
-
-                        loc = self.geolocate(target, event.details['browser']['address'], self.google)
-                        worksheet.write(row, col + 2, loc, wrap_format)
-
-                        user_agent = parse(event.details['browser']['user-agent'])
-                        browser_details = user_agent.browser.family + " " + \
-                            user_agent.browser.version_string
-                        worksheet.write(row, col + 3, browser_details, wrap_format)
-
-                        os_details = user_agent.os.family + " " + user_agent.os.version_string
-                        worksheet.write(row, col + 4, os_details, wrap_format)
-
-                        # Get just the submitted data from the event's payload
-                        submitted_data = ""
-                        data_payload = event.details['payload']
-                        # Get all of the submitted data
-                        for key, value in data_payload.items():
-                            # To get just submitted data, we drop the 'rid' key
-                            if not key == "rid":
-                                submitted_data += f"{key}:{str(value).strip('[').strip(']')}"
-                        worksheet.write(row, col + 5, submitted_data, wrap_format)
-                        row += 1
 
                 target_counter += 1
                 print(f"[+] Processed detailed analysis for {target_counter} of {self.total_targets}.")
@@ -956,6 +1077,78 @@ Ensure the IDs are provided as comma-separated integers or interger ranges, e.g.
             row += 1
 
         print("[+] Finished writing detailed analysis...")
+
+        # Add new worksheet for submission statistics
+        worksheet = goreport_xlsx.add_worksheet("Submission Stats")
+        row = 0
+        col = 0
+        
+        worksheet.set_column(0, 3, 35)
+        
+        # Write header for submission stats
+        worksheet.write(row, col, "Credential Submission Statistics", bold_format)
+        row += 2
+        
+        headers = ["Email Address", "Credential Submissions", "MFA Completions"]
+        header_col = 0
+        for header in headers:
+            worksheet.write(row, header_col, header, header_format)
+            header_col += 1
+        row += 1
+        
+        # Combine and sort statistics
+        all_users = set(self.user_submission_counts.keys()) | set(self.user_mfa_counts.keys())
+        stats_data = []
+        for email in all_users:
+            stats_data.append({
+                'email': email,
+                'submissions': self.user_submission_counts.get(email, 0),
+                'mfa': self.user_mfa_counts.get(email, 0)
+            })
+        
+        # Sort by submissions (primary) and MFA completions (secondary)
+        stats_data.sort(key=lambda x: (x['submissions'], x['mfa']), reverse=True)
+        
+        # Write sorted statistics
+        for stat in stats_data:
+            worksheet.write(row, 0, stat['email'], wrap_format)
+            worksheet.write(row, 1, stat['submissions'], num_format)
+            worksheet.write(row, 2, stat['mfa'], num_format)
+            row += 1
+        
+        # Add summary statistics
+        row += 2
+        worksheet.write(row, col, "Summary Statistics", bold_format)
+        row += 1
+        
+        worksheet.write(row, 0, "Total Unique Users Who Submitted Credentials:", wrap_format)
+        worksheet.write(row, 1, len(self.user_submission_counts), num_format)
+        row += 1
+        
+        worksheet.write(row, 0, "Total Unique Users Who Completed MFA:", wrap_format)
+        worksheet.write(row, 1, len(self.user_mfa_counts), num_format)
+        row += 1
+        
+        worksheet.write(row, 0, "Total Credential Submissions:", wrap_format)
+        worksheet.write(row, 1, sum(self.user_submission_counts.values()), num_format)
+        row += 1
+        
+        worksheet.write(row, 0, "Total MFA Completions:", wrap_format)
+        worksheet.write(row, 1, sum(self.user_mfa_counts.values()), num_format)
+        row += 1
+        
+        # Add average statistics
+        if self.user_submission_counts:
+            avg_submissions = sum(self.user_submission_counts.values()) / len(self.user_submission_counts)
+            worksheet.write(row, 0, "Average Submissions per User:", wrap_format)
+            worksheet.write(row, 1, avg_submissions, num_format)
+        row += 1
+        
+        if self.user_mfa_counts:
+            avg_mfa = sum(self.user_mfa_counts.values()) / len(self.user_mfa_counts)
+            worksheet.write(row, 0, "Average MFA Completions per User:", wrap_format)
+            worksheet.write(row, 1, avg_mfa, num_format)
+
 
         worksheet = goreport_xlsx.add_worksheet("Stats")
         row = 0
@@ -1120,13 +1313,13 @@ Total Targets: {self.total_targets}
 The following totals indicate how many events of each type Gophish recorded:
 Total Open Events: {self.total_opened}
 Total Click Events: {self.total_clicked}
-Total Report Events: {self.total_reported}
+Total Report Events: {self.total_mfa}
 Total Submitted Data Events: {self.total_submitted}
 
 The following totals indicate how many targets participated in each event type:
 Individuals Who Opened: {self.total_unique_opened}
 Individuals Who Clicked: {self.total_unique_clicked}
-Individuals Who Reported: {self.total_unique_reported}
+Individuals Who mfa: {self.total_unique_mfa}
 Individuals Who Submitted: {self.total_unique_submitted}
 
 """)
@@ -1158,7 +1351,7 @@ Individuals Who Submitted: {self.total_unique_submitted}
 
         header4 = table.cell(0, 4)
         header4.text = ""
-        header4.paragraphs[0].add_run("Report", "Cell Text").bold = True
+        header4.paragraphs[0].add_run("MFA", "Cell Text").bold = True
 
         header5 = table.cell(0, 5)
         header5.text = ""
@@ -1195,7 +1388,7 @@ Individuals Who Submitted: {self.total_unique_submitted}
                 temp_cell.paragraphs[0].add_run(u'\u2718', "Cell Text Miss")
 
             temp_cell = table.cell(counter, 4)
-            if target['reported']:
+            if target['mfa']:
                 temp_cell.paragraphs[0].add_run(u'\u2713', "Cell Text Hit")
             else:
                 temp_cell.paragraphs[0].add_run(u'\u2718', "Cell Text Miss")
