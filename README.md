@@ -1,3 +1,58 @@
+# Changes to GoReport to support Evilginx
+
+## New Features and Enhancements
+
+### MFA Tracking
+- Replaced "Report" metrics with "MFA" tracking
+- Now tracks "Captured Session" events instead of "Email/SMS Reported"
+- Added MFA completion statistics to all reports
+- Included MFA events in detailed analysis sections
+
+### Enhanced Event Deduplication
+- Added intelligent deduplication of events within 2-second windows
+- Ignores millisecond differences in timestamps
+- Prevents duplicate counting of identical submission events
+- Maintains accurate statistics for both total and unique events
+
+### Improved User Statistics
+- Added tracking of submission counts per user
+- Added tracking of MFA attempts per user
+- New statistics showing:
+  - Total credential submissions
+  - Total MFA completions
+  - Unique users who submitted credentials
+  - Unique users who completed MFA
+  - Average submissions per user
+  - Average MFA completions per user
+
+### Visual Improvements
+- Enhanced user section headers in Event Details:
+  - Added gray background highlighting
+  - Improved spacing between user sections
+  - Added visual separators between users
+  - Made user headers more prominent with bold formatting
+
+### Expanded Detailed Analysis
+- Now includes detailed analysis for users who:
+  - Clicked the phishing link
+  - Submitted credentials
+  - Completed MFA challenges
+- Complete event details for each interaction including:
+  - Timestamp
+  - IP Address
+  - Location
+  - Browser
+  - Operating System
+  - Submitted Data (for credential submissions)
+
+### Bug Fixes
+- Fixed duplicate event counting in statistics
+- Corrected event processing for accurate user counts
+- Improved handling of payload data in submission events
+- Enhanced timestamp comparison logic
+
+-------------------------------------------------------------------------------------------------------
+
 # Goreport v3.0, a Gophish Reporting Tool
 
 This script accepts your Gophish campaign ID(s) as a parameter and then collects the campaign results to present the statistics and perform user-agent parsing and geolocation lookups for IP addresses. Goreport generates lists of IP addresses, operating systems, browser types and versions, and locations with counts for the number of times each one was seen throughout the campaign.
